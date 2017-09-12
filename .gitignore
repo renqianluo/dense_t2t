@@ -106,3 +106,5 @@ ENV/
 # Bash files
 *.sh
 
+# Train directory
+t2t_train/
