@@ -211,10 +211,10 @@ def transformer_decoder(decoder_input,
                 y = yi
               else:
                 y = tf.concat([y, yi], axis=-1)
-        x = y
+          x_ = y  
         with tf.variable_scope("ffn"):
-          y = transformer_ffn_layer(x, hparams)
-          y = common_layers.layer_postprocess(x, y, hparams)
+          y = transformer_ffn_layer(x_, hparams)
+          y = common_layers.layer_postprocess(x_, y, hparams)
           x = tf.concat([x, y], axis=-1)
           
     # Due to the high dimension of the output, we use a ffn here
