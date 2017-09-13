@@ -18,6 +18,7 @@ from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
+from tensor2tensor.models import transformer
 
 import tensorflow as tf
 
@@ -48,8 +49,8 @@ class TransformerDense(t2t_model.T2TModel):
     encoder_output_list = transformer_encoder(encoder_input, encoder_attention_bias, hparams)
 
     decoder_output = transformer_decoder(decoder_input, 
-        encoder_output_list, decoder_self_attention_bias, 
-        encoder_attention_bias, hparams)
+      encoder_output_list, decoder_self_attention_bias, 
+      encoder_attention_bias, hparams)
     decoder_output = tf.expand_dims(decoder_output, 2)
 
     return decoder_output
@@ -74,16 +75,20 @@ def transformer_prepare_encoder(inputs, target_space, hparams):
   ishape_static = inputs.shape.as_list()
   encoder_input = inputs
   encoder_padding = common_attention.embedding_to_padding(encoder_input)
-  encoder_self_attention_bias = common_attention.attention_bias_ignore_padding(
-      encoder_padding)
+  ignore_padding = common_attention.attention_bias_ignore_padding(encoder_padding)
+  encoder_self_attention_bias = ignore_padding
+  encoder_decoder_attention_bias = ignore_padding
+  if hparams.proximity_bias:
+    encoder_self_attention_bias += common_attention.attention_bias_proximal(
+        tf.shape(inputs)[1])
   # Append target_space_id embedding to inputs.
   emb_target_space = common_layers.embedding(
-      target_space, 32, ishape_static[-1], name="target_space_embedding")
+    target_space, 32, ishape_static[-1], name="target_space_embedding")
   emb_target_space = tf.reshape(emb_target_space, [1, 1, -1])
   encoder_input += emb_target_space
   if hparams.pos == "timing":
     encoder_input = common_attention.add_timing_signal_1d(encoder_input)
-  return (encoder_input, encoder_self_attention_bias, encoder_padding)
+  return (encoder_input, encoder_self_attention_bias, encoder_decoder_attention_bias)
 
 
 def transformer_prepare_decoder(targets, hparams):
@@ -99,12 +104,14 @@ def transformer_prepare_decoder(targets, hparams):
     to implement masked attention and possibly baises for diagonal alignments
   """
   decoder_self_attention_bias = (
-      common_attention.attention_bias_lower_triangle(tf.shape(targets)[1]))
+    common_attention.attention_bias_lower_triangle(tf.shape(targets)[1]))
+  if hparams.proximity_bias:
+    decoder_self_attention_bias += common_attention.attention_bias_proximal(
+      tf.shape(targets)[1])
   decoder_input = common_layers.shift_left_3d(targets)
   if hparams.pos == "timing":
     decoder_input = common_attention.add_timing_signal_1d(decoder_input)
   return (decoder_input, decoder_self_attention_bias)
-
 
 def transformer_encoder(encoder_input,
                         encoder_self_attention_bias,
@@ -123,27 +130,29 @@ def transformer_encoder(encoder_input,
   Returns:
     y: a Tensors
   """
-  concat_feat = encoder_input
+  x = encoder_input
   encoder_output_list = []
 
   with tf.variable_scope(name):
     for layer in xrange(hparams.num_hidden_layers):
       with tf.variable_scope("layer_%d" % layer):
         with tf.variable_scope("self_attention"):
-          x = common_attention.multihead_attention(
-                concat_feat,
-                None,
-                encoder_self_attention_bias,
-                hparams.hidden_size * (2 * layer + 1), #toatl_key_depth
-                hparams.hidden_size * (2 * layer + 1), #total_value_depth
-                hparams.hidden_size, #output_depth
-                hparams.num_heads,
-                hparams.attention_dropout)
-          concat_feat = tf.concat([concat_feat, x], axis=-1)
+          y = common_attention.multihead_attention(
+              x,
+              None, 
+              encoder_self_attention_bias,
+              hparams.hidden_size * (2 * layer + 1), #toatl_key_depth
+              hparams.hidden_size * (2 * layer + 1), #total_value_dept
+              hparams.hidden_size, #output_depth
+              hparams.num_heads,
+              hparams.attention_dropout)
+          y = common_layers.layer_postprocess(x, y, hparams)
+          x = tf.concat([x, y], axis=-1)
         with tf.variable_scope("ffn"):
-          x = transformer_ffn_layer(concat_feat, hparams) 
-          concat_feat = tf.concat([concat_feat, x], axis=-1)
-        encoder_output_list.append(x)
+          y = transformer_ffn_layer(x, hparams)
+          y = common_layers.layer_postprocess(x, y, hparams)
+          x = tf.concat([x, y], axis=-1)
+        encoder_output_list.append(y)
   return encoder_output_list
 
 
@@ -169,41 +178,49 @@ def transformer_decoder(decoder_input,
   Returns:
     y: a Tensors
   """
-  concat_feat = decoder_input
+  x = decoder_input
   with tf.variable_scope(name):
     for layer in xrange(hparams.num_hidden_layers):
       with tf.variable_scope("layer_%d" % layer):
         with tf.variable_scope("self_attention"):
-          x = common_attention.multihead_attention(
-                concat_feat,
-                None,
-                decoder_self_attention_bias,
-                hparams.hidden_size * (2 * layer + 1), #total_key_depth
-                hparams.hidden_size * (2 * layer + 1), #total_value_depth
-                hparams.hidden_size,
-                hparams.num_heads,
-                hparams.attention_dropout)
-          concat_feat = tf.concat([concat_feat, x], axis=-1)
-        for enc_layer in xrange(hparams.num_hidden_layers):
-          with tf.variable_scope("enc_%d_dec_%d_attetion" % (enc_layer, layer)):
-	    xi = common_attention.multihead_attention(
-	        concat_feat,
-	        encoder_output_list[enc_layer],
-	        encoder_decoder_attention_bias,
-	        hparams.hidden_size * (2 * layer + 2), #total_key_depth
-	        hparams.hidden_size * (2 * layer + 2), #total_value_depth
-	        hparams.hidden_size,
-	        hparams.num_heads,
-	        hparams.attention_dropout)
-            if enc_layer == 0:
-              x = xi
-            else:
-	      x = tf.concat([xi, x], axis=-1)
+          y = common_attention.multihead_attention(
+              x,
+              None,
+              decoder_self_attention_bias,
+              hparams.hidden_size * (2 * layer + 1), #total_key_depth
+              hparams.hidden_size * (2 * layer + 1), #total_value_depth
+              hparams.hidden_size,
+              hparams.num_heads,
+              hparams.attention_dropout)
+          y = common_layers.layer_postprocess(x, y, hparams)
+          x = tf.concat([x, y], axis=-1)
+        with tf.variable_scope("encdec_attention"):
+          for enc_layer in xrange(hparams.num_hidden_layers):
+            with tf.variable_scope("enc_%d" % enc_layer):
+              yi = common_attention.multihead_attention(
+                  x,
+                  encoder_output_list[enc_layer],
+                  encoder_decoder_attention_bias,
+                  hparams.hidden_size * (2 * layer + 2), #total_key_depth
+                  hparams.hidden_size * (2 * layer + 2), #total_value_depth
+                  hparams.hidden_size,
+                  hparams.num_heads,
+                  hparams.attention_dropout)
+              yi = common_layers.layer_postprocess(x, yi, hparams)
+              if enc_layer == 0:
+                y = yi
+              else:
+                y = tf.concat([y, yi], axis=-1)
+        x = y
         with tf.variable_scope("ffn"):
-	  x = transformer_ffn_layer(x, hparams)
-          concat_feat = tf.concat([concat_feat, x], axis=-1)
+          y = transformer_ffn_layer(x, hparams)
+          y = common_layers.layer_postprocess(x, y, hparams)
+          x = tf.concat([x, y], axis=-1)
+          
+    # Due to the high dimension of the output, we use a ffn here
     with tf.variable_scope("ffn"):
-      x = transformer_ffn_layer(concat_feat, hparams)
+      y = transformer_ffn_layer(x, hparams)
+      x = common_layers.layer_postprocess(x, y, hparams)
   return x
 
 
@@ -247,3 +264,9 @@ def transformer_ffn_layer(x, hparams):
     return x
 
 
+@registry.register_hparams
+def transformer_dense():
+  hparams = transformer.transformer_base()
+  hparams.layer_preprocess_sequence = "none"
+  hparams.layer_postprocess_sequence = "dn"
+  return hparams
