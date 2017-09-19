@@ -18,6 +18,7 @@ from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
+from tensor2tensor.utils import expert_utils
 from tensor2tensor.models import transformer
 
 import tensorflow as tf
@@ -39,18 +40,18 @@ class TransformerDense(t2t_model.T2TModel):
     inputs = common_layers.flatten4d3d(inputs)
     targets = common_layers.flatten4d3d(targets)
 
-    (encoder_input, encoder_attention_bias, _) = (transformer_prepare_encoder(
-        inputs, target_space, hparams))
+    (encoder_input, encoder_self_attention_bias, encoder_decoder_attention_bias) = transformer_prepare_encoder(
+        inputs, target_space, hparams)
     (decoder_input, decoder_self_attention_bias) = transformer_prepare_decoder(
         targets, hparams)
 
     encoder_input = tf.nn.dropout(encoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
     decoder_input = tf.nn.dropout(decoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
-    encoder_output_list = transformer_encoder(encoder_input, encoder_attention_bias, hparams)
+    encoder_output_list = transformer_encoder(encoder_input, encoder_self_attention_bias, hparams)
 
     decoder_output = transformer_decoder(decoder_input, 
       encoder_output_list, decoder_self_attention_bias, 
-      encoder_attention_bias, hparams)
+      encoder_decoder_attention_bias, hparams)
     decoder_output = tf.expand_dims(decoder_output, 2)
 
     return decoder_output
@@ -134,7 +135,12 @@ def transformer_encoder(encoder_input,
   encoder_output_list = []
 
   with tf.variable_scope(name):
-    for layer in xrange(hparams.num_hidden_layers):
+    pad_remover = None
+    if hparams.use_pad_remover:
+      pad_remover = exper_utils.PadRemover(
+          common_attention.attention_bias_to_padding(
+              encoder_self_attention_bias))
+    for layer in xrange(hparams.num_encoder_layers or hparams.num_hidden_layers):
       with tf.variable_scope("layer_%d" % layer):
         with tf.variable_scope("self_attention"):
           y = common_attention.multihead_attention(
@@ -180,7 +186,7 @@ def transformer_decoder(decoder_input,
   """
   x = decoder_input
   with tf.variable_scope(name):
-    for layer in xrange(hparams.num_hidden_layers):
+    for layer in xrange(hparams.num_decoder_layers or hparams.num_hidden_layers):
       with tf.variable_scope("layer_%d" % layer):
         with tf.variable_scope("self_attention"):
           y = common_attention.multihead_attention(
@@ -224,7 +230,7 @@ def transformer_decoder(decoder_input,
   return x
 
 
-def transformer_ffn_layer(x, hparams):
+def transformer_ffn_layer(x, hparams, pad_remover=None):
   """Feed-forward layer in the transformer.
 
   Args:
@@ -236,17 +242,25 @@ def transformer_ffn_layer(x, hparams):
   """
 
   if hparams.ffn_layer == "conv_hidden_relu":
-    return common_layers.conv_hidden_relu(
+    if pad_remover:
+      original_shape = tf.shape(x)
+      x = tf.reshape(x, tf.concat([[-1], tf.shape(x)[2:]], axis=0))
+      x = tf.expand_dims(pad_remover.remove(x), axis=0)
+    conv_output = common_layers.conv_hidden_relu(
         x,
         hparams.filter_size,
         hparams.hidden_size,
         dropout=hparams.relu_dropout)
+    if pad_remover:
+      conv_output = tf.reshape(
+          pad_remover.restore(tf.squeeze(conv_output, axis=0)), original_shape)
+    return conv_output
   elif hparams.ffn_layer == "parameter_attention":
     return common_attention.parameter_attention(
         x,
         hparams.parameter_attention_key_channels or hparams.hidden_size,
         hparams.parameter_attention_value_channels or hparams.hidden_size,
-        hidden_size,
+        hparams.hidden_size,
         hparams.filter_size,
         hparams.num_heads,
         hparams.attention_dropout)
@@ -254,7 +268,7 @@ def transformer_ffn_layer(x, hparams):
     return common_layers.conv_hidden_relu(
         x,
         hparams.filter_size,
-        hidden_size,
+        hparams.hidden_size,
         kernel_size=(3, 1),
         second_kernel_size=(31, 1),
         padding="LEFT",

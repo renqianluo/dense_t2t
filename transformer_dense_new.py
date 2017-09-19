@@ -18,7 +18,9 @@ from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
+from tensor2tensor.utils import expert_utils
 from tensor2tensor.models import transformer
+
 
 import tensorflow as tf
 
@@ -26,7 +28,7 @@ __author__ = 'renqianluo'
 
 
 @registry.register_model
-class TransformerDense(t2t_model.T2TModel):
+class TransformerDenseNew(t2t_model.T2TModel):
   """Attention net.  See file docstring."""
 
   def model_fn_body(self, features):
@@ -39,18 +41,18 @@ class TransformerDense(t2t_model.T2TModel):
     inputs = common_layers.flatten4d3d(inputs)
     targets = common_layers.flatten4d3d(targets)
 
-    (encoder_input, encoder_attention_bias, _) = transformer_prepare_encoder(
+    (encoder_input, encoder_self_attention_bias, encoder_decoder_attention_bias) = transformer_prepare_encoder(
         inputs, target_space, hparams)
     (decoder_input, decoder_self_attention_bias) = transformer_prepare_decoder(
         targets, hparams)
 
     encoder_input = tf.nn.dropout(encoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
     decoder_input = tf.nn.dropout(decoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
-    encoder_output_list = transformer_encoder(encoder_input, encoder_attention_bias, hparams)
+    encoder_output_list = transformer_encoder(encoder_input, encoder_self_attention_bias, hparams)
 
     decoder_output = transformer_decoder(decoder_input, 
       encoder_output_list, decoder_self_attention_bias, 
-      encoder_attention_bias, hparams)
+      encoder_decoder_attention_bias, hparams)
     decoder_output = tf.expand_dims(decoder_output, 2)
 
     return decoder_output
@@ -233,7 +235,7 @@ def transformer_decoder(decoder_input,
   return y
 
 
-def transformer_ffn_layer(x, hparams):
+def transformer_ffn_layer(x, hparams, pad_remover=None):
   """Feed-forward layer in the transformer.
 
   Args:
@@ -308,8 +310,10 @@ def linear_projection(inputs,
     return ret'''
 
 @registry.register_hparams
-def transformer_dense():
+def transformer_dense_new():
   hparams = transformer.transformer_base()
   hparams.layer_preprocess_sequence = "none"
-  hparams.layer_postprocess_sequence = "dn"
+  hparams.layer_postprocess_sequence = "dan"
+  hparams.hidden_size = 128
+  hparams.filter_size = 512
   return hparams
